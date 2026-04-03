@@ -5,41 +5,7 @@ import time
 import numpy as np
 import sys
 import math
-import os
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import (
-    HandLandmarker, HandLandmarkerOptions, RunningMode,
-)
 from collections import deque, Counter
-
-# ── MEDIAPIPE HAND LANDMARKER (new Tasks API) ───────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
-
-_latest_result = None
-
-def _result_callback(result, image, timestamp_ms):
-    global _latest_result
-    _latest_result = result
-
-hand_options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=RunningMode.LIVE_STREAM,
-    num_hands=1,
-    min_hand_detection_confidence=0.55,
-    min_hand_presence_confidence=0.55,
-    min_tracking_confidence=0.45,
-    result_callback=_result_callback,
-)
-landmarker = HandLandmarker.create_from_options(hand_options)
-
-# Landmark indices
-WRIST = 0
-THUMB_CMC, THUMB_MCP, THUMB_IP, THUMB_TIP = 1, 2, 3, 4
-INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP = 5, 6, 7, 8
-MIDDLE_MCP, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP = 9, 10, 11, 12
-RING_MCP, RING_PIP, RING_DIP, RING_TIP = 13, 14, 15, 16
-PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP = 17, 18, 19, 20
 
 # ── INIT ────────────────────────────────────────────────────
 pygame.init()
@@ -63,6 +29,7 @@ ORANGE    = (255, 152, 72)
 ACCENT    = (255, 96, 148)
 PURPLE    = (168, 112, 255)
 GLOW      = (60, 200, 255)
+CV_CYAN   = (255, 220, 80)    # BGR for OpenCV drawing
 
 # ── FONTS ───────────────────────────────────────────────────
 font_huge  = pygame.font.SysFont("Segoe UI", 88, bold=True)
@@ -95,10 +62,26 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-# ── STATE ───────────────────────────────────────────────────
-gesture_history = deque(maxlen=12)
+# ── ROI ─────────────────────────────────────────────────────
+# Centered box the user places their hand in.
+# Sized as fractions of the frame so it adapts to any resolution.
+ROI_X_FRAC = 0.27   # left edge
+ROI_Y_FRAC = 0.08   # top edge
+ROI_W_FRAC = 0.46   # width
+ROI_H_FRAC = 0.80   # height
+
+def roi_rect(fh, fw):
+    x = int(fw * ROI_X_FRAC)
+    y = int(fh * ROI_Y_FRAC)
+    w = int(fw * ROI_W_FRAC)
+    h = int(fh * ROI_H_FRAC)
+    return x, y, w, h
+
+# ── GESTURE HISTORY ────────────────────────────────────────
+gesture_history = deque(maxlen=15)
+
+# ── REUSABLE SURFACES ──────────────────────────────────────
 _flash_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-_frame_ts = 0
 
 # ── PARTICLES ───────────────────────────────────────────────
 particles = []
@@ -192,147 +175,181 @@ def draw_text_centered(surface, text, font, color, cx, cy):
 def draw_text(surface, text, font, color, x, y):
     surface.blit(font.render(text, True, color), (x, y))
 
-# ── FINGER STATE DETECTION ─────────────────────────────────
-def is_finger_extended(lm, tip_id, pip_id, mcp_id):
+# ════════════════════════════════════════════════════════════
+#  TRADITIONAL CV PIPELINE
+# ════════════════════════════════════════════════════════════
+
+def build_skin_mask(roi_bgr):
     """
-    Check if a finger is extended using both y-comparison and
-    distance-from-wrist ratio, so it works even when the hand is rotated.
+    Skin detection using HSV color thresholding.
+    Defines a skin-tone range in HSV space and creates a binary mask.
     """
-    tip = lm[tip_id]
-    pip_pt = lm[pip_id]
-    mcp = lm[mcp_id]
-    wrist = lm[WRIST]
+    blur = cv2.GaussianBlur(roi_bgr, (5, 5), 0)
 
-    # Method 1: tip is above PIP (works for upright hand)
-    y_extended = tip.y < pip_pt.y
+    # Convert to HSV and threshold for skin-tone range
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    # Primary skin hue range (covers most skin tones)
+    mask1 = cv2.inRange(hsv, (0, 30, 50), (25, 255, 255))
+    # Secondary range for reddish skin tones that wrap around H=180
+    mask2 = cv2.inRange(hsv, (160, 30, 50), (179, 255, 255))
+    mask = cv2.bitwise_or(mask1, mask2)
 
-    # Method 2: tip is farther from wrist than PIP (works at any rotation)
-    tip_dist = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
-    pip_dist = math.hypot(pip_pt.x - wrist.x, pip_pt.y - wrist.y)
-    dist_extended = tip_dist > pip_dist * 1.05
+    # Morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
 
-    # Method 3: tip-to-mcp distance vs pip-to-mcp (finger straightness)
-    tip_mcp = math.hypot(tip.x - mcp.x, tip.y - mcp.y)
-    pip_mcp = math.hypot(pip_pt.x - mcp.x, pip_pt.y - mcp.y)
-    straight_extended = tip_mcp > pip_mcp * 1.2
+    return mask
 
-    # Count votes — extended if at least 2 of 3 agree
-    votes = int(y_extended) + int(dist_extended) + int(straight_extended)
-    return votes >= 2
 
-def get_finger_states(lm):
-    """Returns dict of which fingers are extended."""
-    # Thumb uses a different test
-    palm_cx = (lm[WRIST].x + lm[INDEX_MCP].x) / 2
-    palm_cy = (lm[WRIST].y + lm[INDEX_MCP].y) / 2
-    tip_dist = math.hypot(lm[THUMB_TIP].x - palm_cx, lm[THUMB_TIP].y - palm_cy)
-    ip_dist = math.hypot(lm[THUMB_IP].x - palm_cx, lm[THUMB_IP].y - palm_cy)
-    thumb_ext = tip_dist > ip_dist * 1.2
+def count_defects(contour, hull_indices):
+    """
+    Count convexity defects that represent valleys between extended fingers.
+    Uses adaptive depth threshold + angle filter.
+    Returns (count, list_of_far_points_for_drawing).
+    """
+    if hull_indices is None or len(hull_indices) < 3:
+        return 0, []
 
-    index_ext = is_finger_extended(lm, INDEX_TIP, INDEX_PIP, INDEX_MCP)
-    middle_ext = is_finger_extended(lm, MIDDLE_TIP, MIDDLE_PIP, MIDDLE_MCP)
-    ring_ext = is_finger_extended(lm, RING_TIP, RING_PIP, RING_MCP)
-    pinky_ext = is_finger_extended(lm, PINKY_TIP, PINKY_PIP, PINKY_MCP)
+    defects = cv2.convexityDefects(contour, hull_indices)
+    if defects is None:
+        return 0, []
 
-    return {
-        "thumb": thumb_ext,
-        "index": index_ext,
-        "middle": middle_ext,
-        "ring": ring_ext,
-        "pinky": pinky_ext,
-    }
+    peri = cv2.arcLength(contour, True)
+    area = cv2.contourArea(contour)
+    if peri < 1:
+        return 0, []
 
-def classify_gesture(lm):
-    """Classify Rock / Paper / Scissors from landmark positions."""
-    fingers = get_finger_states(lm)
-    index = fingers["index"]
-    middle = fingers["middle"]
-    ring = fingers["ring"]
-    pinky = fingers["pinky"]
+    # Depth threshold: proportional to hand size so it scales with distance
+    min_depth = max(12.0, peri * 0.02)
 
-    main_up = sum([index, middle, ring, pinky])
+    count = 0
+    far_pts = []
+    for i in range(defects.shape[0]):
+        s, e, f, d = defects[i, 0]
+        depth = d / 256.0
+        if depth < min_depth:
+            continue
 
-    # Scissors: index + middle up, ring + pinky down (thumb ignored)
-    if index and middle and not ring and not pinky:
-        return "Scissors", main_up
+        start = contour[s][0]
+        end   = contour[e][0]
+        far   = contour[f][0]
 
-    # Paper: 3-4 of the main fingers extended
-    if main_up >= 3:
-        return "Paper", main_up
+        # Triangle sides
+        a = np.hypot(end[0] - start[0], end[1] - start[1])
+        b = np.hypot(far[0] - start[0], far[1] - start[1])
+        c = np.hypot(end[0] - far[0],   end[1] - far[1])
 
-    # Rock: 0-1 main fingers extended
-    if main_up <= 1:
-        return "Rock", main_up
+        if b < 1 or c < 1:
+            continue
 
-    # 2 fingers but not index+middle → likely a sloppy scissors
-    if main_up == 2 and (index or middle):
-        return "Scissors", main_up
+        # Angle at the far point (valley between two fingers)
+        cos_angle = (b * b + c * c - a * a) / (2 * b * c)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle_deg = math.degrees(math.acos(cos_angle))
 
-    return "Rock", main_up
+        # Real finger valleys are roughly 20°–100°
+        if angle_deg < 100:
+            count += 1
+            far_pts.append(tuple(far))
+
+    return count, far_pts
+
+
+def classify_gesture(defect_count, solidity, circularity):
+    """
+    Heuristic classification from convexity defect count:
+      0 defects        → Rock  (closed fist)
+      1–3 defects      → Scissors  (two fingers up)
+      4+ defects       → Paper  (open palm)
+    """
+    if defect_count == 0:
+        return "Rock"
+    if defect_count <= 3:
+        return "Scissors"
+    return "Paper"
+
 
 def stable_gesture(history):
+    """Return the most common real gesture in recent history."""
     real = [g for g in history if g != "---"]
     if len(real) < 3:
         return "---"
-    recent = list(history)[-7:]
-    real_recent = [g for g in recent if g != "---"]
-    if not real_recent:
+    recent_real = [g for g in list(history)[-9:] if g != "---"]
+    if not recent_real:
         return "---"
-    best, cnt = Counter(real_recent).most_common(1)[0]
+    best, cnt = Counter(recent_real).most_common(1)[0]
     if cnt >= 3:
         return best
     return "---"
 
-# ── DRAW HAND ON FRAME ─────────────────────────────────────
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-]
-
-def draw_hand_on_frame(frame, landmarks):
-    h, w = frame.shape[:2]
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (80, 220, 255), 2, cv2.LINE_AA)
-    for i, pt in enumerate(pts):
-        color = (60, 255, 160) if i in (4, 8, 12, 16, 20) else (255, 200, 80)
-        cv2.circle(frame, pt, 5, color, -1, cv2.LINE_AA)
 
 # ── PROCESS FRAME ──────────────────────────────────────────
 def process_frame(frame):
-    global _latest_result, _frame_ts
-
-    # Mirror the frame so it feels like a mirror to the user
     frame = cv2.flip(frame, 1)
+    fh, fw = frame.shape[:2]
+    rx, ry, rw, rh = roi_rect(fh, fw)
+    roi = frame[ry:ry + rh, rx:rx + rw]
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    _frame_ts += 33
-    landmarker.detect_async(mp_image, _frame_ts)
+    if roi.size == 0:
+        gesture_history.append("---")
+        return frame, stable_gesture(gesture_history)
+
+    mask = build_skin_mask(roi)
+    roi_area = rw * rh
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detected = "---"
-    n_fingers = -1
-    result = _latest_result
+    debug_text = ""
 
-    if result and result.hand_landmarks:
-        lm_list = result.hand_landmarks[0]
-        draw_hand_on_frame(frame, lm_list)
-        detected, n_fingers = classify_gesture(lm_list)
+    if contours:
+        hand = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(hand)
+        min_area = max(3000, roi_area * 0.05)
+
+        if area > min_area:
+            # Draw contour
+            cv2.drawContours(roi, [hand], -1, (80, 200, 255), 2, cv2.LINE_AA)
+
+            # Convex hull
+            hull_pts = cv2.convexHull(hand, returnPoints=True)
+            hull_idx = cv2.convexHull(hand, returnPoints=False)
+            cv2.drawContours(roi, [hull_pts], -1, (80, 255, 140), 2, cv2.LINE_AA)
+
+            hull_area = cv2.contourArea(hull_pts)
+            solidity = area / hull_area if hull_area > 0 else 0
+
+            peri = cv2.arcLength(hand, True)
+            circularity = (4 * math.pi * area) / (peri * peri) if peri > 0 else 0
+
+            defect_count, far_pts = count_defects(hand, hull_idx)
+
+            # Draw defect points (valleys between fingers)
+            for pt in far_pts:
+                cv2.circle(roi, pt, 6, (0, 0, 255), -1, cv2.LINE_AA)
+
+            detected = classify_gesture(defect_count, solidity, circularity)
+            debug_text = f"d={defect_count} sol={solidity:.2f}"
 
     gesture_history.append(detected)
     stable = stable_gesture(gesture_history)
 
+    # Draw ROI rectangle
+    cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (120, 220, 255), 2)
+
+    # HUD text
     label = stable
-    if n_fingers >= 0:
-        label += f"  ({n_fingers})"
-    cv2.putText(frame, label, (12, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 220, 255), 2, cv2.LINE_AA)
+    if debug_text:
+        label += f"  [{debug_text}]"
+    cv2.putText(frame, label, (rx, max(20, ry - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 220, 255), 2, cv2.LINE_AA)
 
     return frame, stable
+
 
 # ── FRAME → PYGAME SURFACE ─────────────────────────────────
 def frame_to_surface(frame):
@@ -340,6 +357,7 @@ def frame_to_surface(frame):
     h, w = rgb.shape[:2]
     surf = pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
     return surf.copy()
+
 
 # ════════════════════════════════════════════════════════════
 #  START SCREEN
@@ -362,8 +380,8 @@ def start_screen():
         screen.blit(hdr, (0, 0))
 
         draw_text_centered(screen, "Rock  Paper  Scissors", font_big, YELLOW, WIDTH // 2, 148)
-        draw_text_centered(screen, "Gesture Recognition", font_med, WHITE, WIDTH // 2, 218)
-        draw_text_centered(screen, "Hold your hand in front of the camera — no keyboard needed.",
+        draw_text_centered(screen, "Traditional CV Pipeline", font_med, WHITE, WIDTH // 2, 218)
+        draw_text_centered(screen, "Place your hand inside the blue box — good lighting helps.",
                            font_small, GRAY, WIDTH // 2, 272)
 
         labels = ["Rock", "Paper", "Scissors"]
@@ -392,6 +410,7 @@ def start_screen():
         pygame.display.flip()
         clock.tick(60)
 
+
 # ════════════════════════════════════════════════════════════
 #  COUNTDOWN
 # ════════════════════════════════════════════════════════════
@@ -405,6 +424,7 @@ def countdown_screen():
         while time.time() - start < 0.85:
             ret, frame = cap.read()
             if ret:
+                frame = cv2.flip(frame, 1)
                 surf = frame_to_surface(frame)
                 surf = pygame.transform.smoothscale(surf, (640, 480))
                 screen.blit(surf, (10, 20))
@@ -427,6 +447,7 @@ def countdown_screen():
 
             pygame.display.flip()
             clock.tick(60)
+
 
 # ════════════════════════════════════════════════════════════
 #  WINNER SCREEN
@@ -482,6 +503,7 @@ def winner_screen(player_score, computer_score):
 
         pygame.display.flip()
         clock.tick(60)
+
 
 # ════════════════════════════════════════════════════════════
 #  GAME SCREEN
@@ -621,11 +643,11 @@ def game_screen():
 
     return player_score, computer_score
 
+
 # ════════════════════════════════════════════════════════════
 #  CLEANUP & MAIN
 # ════════════════════════════════════════════════════════════
 def cleanup():
-    landmarker.close()
     cap.release()
     pygame.quit()
 
