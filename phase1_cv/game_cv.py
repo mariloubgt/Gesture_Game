@@ -1,6 +1,7 @@
 import cv2
 import random
 import time
+import numpy as np
 
 cap = cv2.VideoCapture(0)
 
@@ -11,10 +12,10 @@ cv2.namedWindow("Gesture Game", cv2.WINDOW_NORMAL)
 cv2.moveWindow("Gesture Game", 100, 100)
 cv2.resizeWindow("Gesture Game", 800, 600)
 
-player_score = 0
+player_score = 0 
 computer_score = 0
 last_round_time = time.time()
-round_delay = 3  # seconds
+round_delay = 3 
 current_gesture = ""
 computer_choice = ""
 result = ""
@@ -70,17 +71,37 @@ while True:
 
             defect_count = 0
 
+            # --- FIX 2: angle filter ---
             if defects is not None:
                 for i in range(defects.shape[0]):
                     s, e, f, d = defects[i, 0]
                     depth = d / 256.0
+
+                    # FIX 1: raised depth threshold
                     if depth > 35:
-                        defect_count += 1
-                        far = tuple(hand_contour[f][0])
-                        cv2.circle(roi, far, 5, (0, 0, 255), -1)
+                        start = tuple(hand_contour[s][0])
+                        end   = tuple(hand_contour[e][0])
+                        far   = tuple(hand_contour[f][0])
+
+                        # Calculate angle at the defect point
+                        a = ((end[0]-start[0])**2 + (end[1]-start[1])**2) ** 0.5
+                        b = ((far[0]-start[0])**2  + (far[1]-start[1])**2) ** 0.5
+                        c = ((end[0]-far[0])**2    + (end[1]-far[1])**2)   ** 0.5
+
+                        angle = (b**2 + c**2 - a**2) / (2*b*c + 1e-6)
+
+                        # Only count if angle < 90 degrees (real finger gap)
+                        if angle < 0.3:
+                            defect_count += 1
+                            cv2.circle(roi, far, 5, (0, 0, 255), -1)
+
+            # --- FIX 3: solidity check for rock ---
+            area = cv2.contourArea(hand_contour)
+            hull_area = cv2.contourArea(hull_points)
+            solidity = area / hull_area if hull_area > 0 else 0
 
             # --- Classify the gesture ---
-            if defect_count == 0:
+            if defect_count == 0 or solidity > 0.9:
                 gesture = "Rock"
             elif 1 <= defect_count <= 3:
                 gesture = "Scissors"
@@ -91,6 +112,8 @@ while True:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 2)
             cv2.putText(frame, f"Defects: {defect_count}", (30, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, f"Solidity: {solidity:.2f}", (30, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
             # --- STAGE 5: Game logic with timer ---
             current_gesture = gesture
@@ -105,14 +128,14 @@ while True:
                 elif result == "Computer wins!":
                     computer_score += 1
 
-                last_round_time = now  # reset the timer
+                last_round_time = now
 
             # Display game info
-            cv2.putText(frame, f"Computer: {computer_choice}", (30, 140),
+            cv2.putText(frame, f"Computer: {computer_choice}", (30, 160),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(frame, f"Result: {result}", (30, 180),
+            cv2.putText(frame, f"Result: {result}", (30, 200),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(frame, f"Score  You: {player_score}  PC: {computer_score}", (30, 220),
+            cv2.putText(frame, f"Score  You: {player_score}  PC: {computer_score}", (30, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
     # Show the mask in a separate window
