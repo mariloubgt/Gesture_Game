@@ -30,6 +30,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.utils.class_weight import compute_class_weight
 
 # ── PATHS ───────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,25 @@ def _find_mobilenet_backbone(model):
         if "mobilenet" in layer.name.lower():
             return layer
     return model.layers[1]
+
+
+def build_class_weight_dict(train_dir, paper_extra=1.35):
+    """Balanced weights from folder counts; bump paper (index 0) for better palm recall."""
+    counts = []
+    for name in CLASS_NAMES:
+        d = os.path.join(train_dir, name)
+        n = 0
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                    n += 1
+        counts.append(max(n, 1))
+    y_dummy = np.concatenate([np.full(c, i) for i, c in enumerate(counts)])
+    cw = compute_class_weight("balanced", classes=np.arange(3), y=y_dummy)
+    cw = np.asarray(cw, dtype=np.float64)
+    cw[0] *= paper_extra
+    cw = cw / cw.mean()
+    return {int(i): float(cw[i]) for i in range(3)}
 
 
 def load_datasets():
@@ -78,6 +98,8 @@ def load_datasets():
 # ── LOAD DATA ───────────────────────────────────────────────
 print("Loading datasets ...")
 train_ds_raw, val_ds_raw = load_datasets()
+CLASS_WEIGHT = build_class_weight_dict(TRAIN_DIR)
+print("Class weights (paper emphasised):", CLASS_WEIGHT)
 
 # ── AUGMENTATION ────────────────────────────────────────────
 augmenter = tf.keras.Sequential([
@@ -98,10 +120,23 @@ def augment_and_preprocess(images, labels):
 def preprocess_only(images, labels):
     return preprocess_input(images), labels
 
+
+def add_sample_weight(images, labels):
+    idx = tf.argmax(labels, axis=-1, output_type=tf.int32)
+    sw = tf.gather(_CW_VEC, idx)
+    return images, labels, sw
+
+
 AUTOTUNE = tf.data.AUTOTUNE
-train_ds = (train_ds_raw
-            .map(augment_and_preprocess, num_parallel_calls=AUTOTUNE)
-            .prefetch(AUTOTUNE))
+_CW_VEC = tf.constant(
+    [CLASS_WEIGHT[0], CLASS_WEIGHT[1], CLASS_WEIGHT[2]],
+    dtype=tf.float32,
+)
+train_ds = (
+    train_ds_raw.map(augment_and_preprocess, num_parallel_calls=AUTOTUNE)
+    .map(add_sample_weight, num_parallel_calls=AUTOTUNE)
+    .prefetch(AUTOTUNE)
+)
 val_ds = (val_ds_raw
           .map(preprocess_only, num_parallel_calls=AUTOTUNE)
           .prefetch(AUTOTUNE))

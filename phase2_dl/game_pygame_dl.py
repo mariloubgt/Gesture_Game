@@ -32,8 +32,15 @@ _output_detail = interpreter.get_output_details()[0]
 _input_idx     = _input_detail["index"]
 _output_idx    = _output_detail["index"]
 
+# Order MUST match train.py / dataset: paper=0, rock=1, scissors=2
 CLASS_NAMES = ["Paper", "Rock", "Scissors"]
+IDX_PAPER, IDX_ROCK, IDX_SCISSORS = 0, 1, 2
 IMG_SIZE    = (224, 224)
+# Paper softmax is often flatter than rock/scissors; use lower accept bar.
+_MIN_CONF = {"Paper": 0.26, "Rock": 0.40, "Scissors": 0.40}
+# Training crops are mostly “hand fills frame”. Zoom central ROI so webcam hands aren’t tiny at 224².
+_ZOOM_WIDE = 0.82   # mild crop — keeps full gesture context
+_ZOOM_TIGHT = 0.55  # stronger zoom — helps open palm when hand doesn’t fill the box
 print("Model ready.")
 
 # ── THREADED INFERENCE ──────────────────────────────────────
@@ -43,16 +50,71 @@ _infer_frame = None
 _infer_ready = threading.Event()
 _running     = True
 
-def _preprocess(roi_bgr):
-    """Resize, centre-crop slightly, and apply MobileNetV2 preprocessing."""
+def _center_crop(roi_bgr, frac):
+    """Keep centre `frac` of width/height (0<frac<=1). frac=0.6 => digital zoom ~1.67×."""
     h, w = roi_bgr.shape[:2]
-    # 90% centre crop to reduce background noise around the hand
-    margin_x, margin_y = int(w * 0.05), int(h * 0.05)
-    cropped = roi_bgr[margin_y:h - margin_y, margin_x:w - margin_x]
+    frac = max(0.35, min(1.0, float(frac)))
+    nw, nh = int(w * frac), int(h * frac)
+    x0 = (w - nw) // 2
+    y0 = (h - nh) // 2
+    return roi_bgr[y0:y0 + nh, x0:x0 + nw]
+
+
+def _preprocess(roi_bgr, zoom_frac=_ZOOM_WIDE):
+    """Centre-zoom (match training scale), CLAHE, resize, MobileNet [-1,1] input."""
+    cropped = _center_crop(roi_bgr, zoom_frac)
+    if cropped.size == 0:
+        cropped = roi_bgr
+    lab = cv2.cvtColor(cropped, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_ch = clahe.apply(l_ch)
+    cropped = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
     rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
     resized = cv2.resize(rgb, IMG_SIZE).astype(np.float32)
     resized = (resized / 127.5) - 1.0
     return np.expand_dims(resized, axis=0)
+
+
+def _fuse_probs_for_paper(p_wide, p_zoom):
+    """
+    Blend two softmax views. When the tight zoom raises paper mass (small hand / far away),
+    trust it more — that view is closer to dataset framing.
+    """
+    pw = np.asarray(p_wide, dtype=np.float64)
+    pz = np.asarray(p_zoom, dtype=np.float64)
+    if pz[IDX_PAPER] > pw[IDX_PAPER] + 0.05 and pz[IDX_PAPER] >= 0.18:
+        return 0.28 * pw + 0.72 * pz
+    return 0.62 * pw + 0.38 * pz
+
+
+def _decode_gesture(probs):
+    """
+    Map softmax to label. Open palm (paper) is often a close second to rock;
+    use margin rules so paper is not dropped when argmax is rock with low gap.
+    """
+    p = np.asarray(probs, dtype=np.float64)
+    p_paper = float(p[IDX_PAPER])
+    p_rock = float(p[IDX_ROCK])
+    p_sci = float(p[IDX_SCISSORS])
+    top_i = int(np.argmax(p))
+    top_p = float(p[top_i])
+
+    # Rock vs paper: model frequently picks rock on real webcam palms / small hands
+    if top_i == IDX_ROCK:
+        if p_paper >= 0.18 and (p_rock - p_paper) <= 0.28:
+            label, conf = "Paper", p_paper
+        else:
+            label, conf = "Rock", p_rock
+    elif top_i == IDX_SCISSORS:
+        label, conf = "Scissors", p_sci
+    else:
+        label, conf = "Paper", p_paper
+
+    if conf < _MIN_CONF[label]:
+        return "---", conf
+    return label, conf
+
 
 def _inference_worker():
     """Background thread: picks up frames and runs TFLite inference."""
@@ -64,14 +126,20 @@ def _inference_worker():
             frame = _infer_frame
         if frame is None:
             continue
-        inp = _preprocess(frame)
-        interpreter.set_tensor(_input_idx, inp)
+        inp_w = _preprocess(frame, _ZOOM_WIDE)
+        interpreter.set_tensor(_input_idx, inp_w)
         interpreter.invoke()
-        preds = interpreter.get_tensor(_output_idx)[0]
-        idx = int(np.argmax(preds))
-        conf = float(preds[idx])
+        p_wide = interpreter.get_tensor(_output_idx)[0].astype(np.float64)
+
+        inp_z = _preprocess(frame, _ZOOM_TIGHT)
+        interpreter.set_tensor(_input_idx, inp_z)
+        interpreter.invoke()
+        p_zoom = interpreter.get_tensor(_output_idx)[0].astype(np.float64)
+
+        preds = _fuse_probs_for_paper(p_wide, p_zoom)
+        label, conf = _decode_gesture(preds)
         with _lock:
-            _latest_pred = (CLASS_NAMES[idx], conf)
+            _latest_pred = (label, conf)
 
 _worker = threading.Thread(target=_inference_worker, daemon=True)
 _worker.start()
@@ -141,11 +209,11 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-# ── ROI ─────────────────────────────────────────────────────
-ROI_X_FRAC = 0.27
-ROI_Y_FRAC = 0.08
-ROI_W_FRAC = 0.46
-ROI_H_FRAC = 0.80
+# ── ROI (slightly tighter than before: hand fills more pixels at normal arm length) ──
+ROI_X_FRAC = 0.30
+ROI_Y_FRAC = 0.10
+ROI_W_FRAC = 0.40
+ROI_H_FRAC = 0.68
 
 def roi_rect(fh, fw):
     x = int(fw * ROI_X_FRAC)
@@ -252,15 +320,17 @@ def draw_text(surface, text, font, color, x, y):
     surface.blit(font.render(text, True, color), (x, y))
 
 def stable_gesture(history, confs):
-    """Confidence-weighted majority vote over recent predictions."""
+    """Confidence-weighted vote; slight boost for Paper so open palm stabilises faster."""
     window = list(history)[-9:]
     cwindow = list(confs)[-9:]
+    paper_boost = 1.28
 
     scores = {}
     for g, c in zip(window, cwindow):
         if g == "---":
             continue
-        scores[g] = scores.get(g, 0.0) + c
+        w = paper_boost if g == "Paper" else 1.0
+        scores[g] = scores.get(g, 0.0) + c * w
 
     if not scores:
         return "---"
@@ -273,7 +343,8 @@ def stable_gesture(history, confs):
 
 # ── PROCESS FRAME ──────────────────────────────────────────
 _frame_count = 0
-INFER_EVERY  = 2  # run CNN every Nth frame (more frequent = more responsive)
+# Two TFLite runs per submit (wide + tight zoom); skip more frames to keep CPU similar.
+INFER_EVERY  = 3
 
 def process_frame(frame):
     global _frame_count
@@ -287,8 +358,7 @@ def process_frame(frame):
         submit_roi(roi)
 
     detected, conf = get_prediction()
-    if conf < 0.45:
-        detected = "---"
+    # Thresholds applied inside _decode_gesture (per-class)
 
     gesture_history.append(detected)
     conf_history.append(conf)
@@ -329,7 +399,7 @@ def start_screen():
 
         draw_text_centered(screen, "Rock  Paper  Scissors", font_big, YELLOW, WIDTH // 2, 148)
         draw_text_centered(screen, "Deep Learning (MobileNetV2)", font_med, WHITE, WIDTH // 2, 218)
-        draw_text_centered(screen, "Hold your hand in the box — the CNN classifies it.",
+        draw_text_centered(screen, "Center your hand in the box — open palm works best when the hand fills most of it.",
                            font_small, GRAY, WIDTH // 2, 272)
 
         labels = ["Rock", "Paper", "Scissors"]
