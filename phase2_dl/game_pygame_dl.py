@@ -400,13 +400,15 @@ def start_screen():
         draw_text_centered(screen, "Rock  Paper  Scissors", font_big, YELLOW, WIDTH // 2, 148)
         draw_text_centered(screen, "Deep Learning (MobileNetV2)", font_med, WHITE, WIDTH // 2, 218)
         draw_text_centered(screen, "Center your hand in the box — open palm works best when the hand fills most of it.",
-                           font_small, GRAY, WIDTH // 2, 272)
+                           font_small, GRAY, WIDTH // 2, 262)
+        draw_text_centered(screen, "3s prepare after GO! — then 5s each round to lock your gesture.",
+                           font_tiny, GRAY, WIDTH // 2, 292)
 
         labels = ["Rock", "Paper", "Scissors"]
         colors = [ORANGE, BLUE, ACCENT]
         for i, (lbl, col) in enumerate(zip(labels, colors)):
             cx = WIDTH // 2 - 130 + i * 130
-            cy = int(338 + 5 * math.sin(pulse + i * 1.1))
+            cy = int(348 + 5 * math.sin(pulse + i * 1.1))
             draw_rounded_rect(screen, col, (cx - 56, cy - 28, 112, 56), radius=14, alpha=50)
             draw_text_centered(screen, lbl, font_small, col, cx, cy)
 
@@ -429,7 +431,7 @@ def start_screen():
         clock.tick(60)
 
 # ════════════════════════════════════════════════════════════
-#  COUNTDOWN
+#  COUNTDOWN (before prep phase)
 # ════════════════════════════════════════════════════════════
 def countdown_screen():
     clock = pygame.time.Clock()
@@ -456,7 +458,13 @@ def countdown_screen():
             radius = int(88 + 18 * math.sin(elapsed * 8))
             pygame.draw.circle(screen, (*color, 55), (WIDTH // 2, HEIGHT // 2), radius)
             pygame.draw.circle(screen, color, (WIDTH // 2, HEIGHT // 2), radius, 3)
-            draw_text_centered(screen, label, font_huge, color, WIDTH // 2, HEIGHT // 2)
+            draw_text_centered(screen, label, font_huge, color, WIDTH // 2, HEIGHT // 2 - 18)
+            if label != "GO!":
+                draw_text_centered(screen, "Game starting…", font_small, GRAY,
+                                   WIDTH // 2, HEIGHT // 2 + 58)
+            else:
+                draw_text_centered(screen, "Then: prepare your gesture", font_small, GRAY,
+                                   WIDTH // 2, HEIGHT // 2 + 58)
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -524,6 +532,9 @@ def winner_screen(player_score, computer_score):
 #  GAME SCREEN
 # ════════════════════════════════════════════════════════════
 CAM_W, CAM_H = 640, 580
+ROUND_DELAY = 5.0   # seconds between gesture lock-ins
+PREP_SECONDS = 3.0  # time to position hand before round 1 timer starts
+
 
 def game_screen():
     player_score = 0
@@ -532,13 +543,16 @@ def game_screen():
     round_num = 0
     max_rounds = 5
     last_round_time = time.time()
-    round_delay = 3.0
     gesture = "---"
     computer_choice = "---"
     result = "Show your hand!"
     clock = pygame.time.Clock()
 
     countdown_screen()
+
+    session_t0 = time.time()
+    prep_until = session_t0 + PREP_SECONDS
+    round_timer_armed = False
 
     while True:
         screen.fill(BG)
@@ -560,10 +574,25 @@ def game_screen():
         screen.blit(cam_surf, (10 + ox, 20 + oy))
 
         now = time.time()
-        elapsed = now - last_round_time
-        countdown = max(0, int(round_delay - elapsed))
+        in_prep = now < prep_until
+        if in_prep:
+            prep_left = prep_until - now
+        else:
+            if not round_timer_armed:
+                last_round_time = now
+                round_timer_armed = True
 
-        if elapsed >= round_delay and gesture != "---" and round_num < max_rounds:
+        elapsed = now - last_round_time if round_timer_armed else 0.0
+        lock_in_left = max(0.0, ROUND_DELAY - elapsed)
+        lock_in_digit = int(math.ceil(lock_in_left - 1e-9)) if lock_in_left > 0 else 0
+
+        if (
+            not in_prep
+            and round_timer_armed
+            and elapsed >= ROUND_DELAY
+            and gesture != "---"
+            and round_num < max_rounds
+        ):
             computer_choice = random.choice(["Rock", "Paper", "Scissors"])
             result = get_winner(gesture, computer_choice)
             round_num += 1
@@ -619,33 +648,55 @@ def game_screen():
         pygame.draw.rect(screen, c_color, (px + 24, 214, 4, 54), border_radius=2)
         draw_text_centered(screen, computer_choice, font_med, c_color, px + 210, 241)
 
-        r_color = RESULT_COLOR.get(result, GRAY)
-        draw_rounded_rect(screen, r_color, (px + 24, 280, 372, 58), radius=14, alpha=48)
-        draw_text_centered(screen, result, font_med, r_color, px + 210, 309)
+        if in_prep:
+            draw_rounded_rect(screen, PURPLE, (px + 24, 268, 372, 88), radius=16, alpha=55)
+            pygame.draw.rect(screen, PURPLE, (px + 24, 268, 4, 88), border_radius=2)
+            draw_text_centered(screen, "Prepare gesture", font_small, PURPLE, px + 210, 292)
+            draw_text_centered(screen, str(int(math.ceil(prep_left))), font_huge, WHITE,
+                               px + 210, 332)
+            draw_text_centered(screen, "Round 1 timer starts after", font_tiny, GRAY,
+                               px + 210, 378)
+            draw_rounded_rect(screen, DARK_GRAY, (px + 24, 392, 372, 36), radius=10, alpha=200)
+            draw_text_centered(screen, "Hold position in the box", font_tiny, GRAY,
+                               px + 210, 410)
+        else:
+            r_color = RESULT_COLOR.get(result, GRAY)
+            draw_rounded_rect(screen, r_color, (px + 24, 280, 372, 58), radius=14, alpha=48)
+            draw_text_centered(screen, result, font_med, r_color, px + 210, 309)
 
-        draw_text(screen, "Next round", font_tiny, GRAY, px + 24, 352)
-        for i in range(3):
-            cx = px + 68 + i * 118
-            active = (3 - i) <= countdown
-            dot_col = YELLOW if active else DARK_GRAY
-            draw_rounded_rect(screen, dot_col, (cx - 26, 368, 52, 40), radius=10)
-            draw_text_centered(screen, str(3 - i), font_med,
-                               BG if active else GRAY, cx, 388)
+        if not in_prep:
+            draw_text(screen, "Lock in", font_tiny, GRAY, px + 24, 352)
+            pygame.draw.rect(screen, DARK_GRAY, (px + 24, 372, 372, 12), border_radius=6)
+            prog = min(1.0, elapsed / ROUND_DELAY) if round_timer_armed else 0.0
+            if prog > 0:
+                pygame.draw.rect(screen, GLOW, (px + 24, 372, max(10, int(372 * prog)), 12),
+                                 border_radius=6)
+            cd_col = YELLOW if lock_in_digit <= 2 else WHITE
+            draw_text_centered(screen, f"{lock_in_digit}s", font_big, cd_col, px + 210, 404)
+            draw_text_centered(screen, f"next read in {lock_in_digit}s" if lock_in_digit else "show gesture!",
+                               font_tiny, GRAY, px + 210, 448)
 
-        pygame.draw.line(screen, DARK_GRAY, (px + 24, 428), (px + 396, 428), 1)
-        draw_text_centered(screen, "Score", font_small, WHITE, px + 210, 448)
+        if in_prep:
+            ban = pygame.Surface((CAM_W, 76), pygame.SRCALPHA)
+            ban.fill((*PURPLE, 140))
+            screen.blit(ban, (10 + ox, 20 + oy + CAM_H - 76))
+            draw_text_centered(screen, f"PREPARE  •  {int(math.ceil(prep_left))}s",
+                                font_med, WHITE, 10 + ox + CAM_W // 2, 20 + oy + CAM_H - 42)
 
-        draw_rounded_rect(screen, GREEN, (px + 24, 468, 108, 60), radius=12, alpha=38)
-        draw_text_centered(screen, "You", font_tiny, GRAY, px + 78, 484)
-        draw_text_centered(screen, str(player_score), font_med, GREEN, px + 78, 510)
+        pygame.draw.line(screen, DARK_GRAY, (px + 24, 468), (px + 396, 468), 1)
+        draw_text_centered(screen, "Score", font_small, WHITE, px + 210, 488)
 
-        draw_rounded_rect(screen, YELLOW, (px + 152, 468, 108, 60), radius=12, alpha=38)
-        draw_text_centered(screen, "Tie", font_tiny, GRAY, px + 206, 484)
-        draw_text_centered(screen, str(ties), font_med, YELLOW, px + 206, 510)
+        draw_rounded_rect(screen, GREEN, (px + 24, 504, 108, 52), radius=12, alpha=38)
+        draw_text_centered(screen, "You", font_tiny, GRAY, px + 78, 518)
+        draw_text_centered(screen, str(player_score), font_med, GREEN, px + 78, 540)
 
-        draw_rounded_rect(screen, RED, (px + 280, 468, 108, 60), radius=12, alpha=38)
-        draw_text_centered(screen, "PC", font_tiny, GRAY, px + 334, 484)
-        draw_text_centered(screen, str(computer_score), font_med, RED, px + 334, 510)
+        draw_rounded_rect(screen, YELLOW, (px + 152, 504, 108, 52), radius=12, alpha=38)
+        draw_text_centered(screen, "Tie", font_tiny, GRAY, px + 206, 518)
+        draw_text_centered(screen, str(ties), font_med, YELLOW, px + 206, 540)
+
+        draw_rounded_rect(screen, RED, (px + 280, 504, 108, 52), radius=12, alpha=38)
+        draw_text_centered(screen, "PC", font_tiny, GRAY, px + 334, 518)
+        draw_text_centered(screen, str(computer_score), font_med, RED, px + 334, 540)
 
         draw_text_centered(screen, "Q — quit", font_tiny, DARK_GRAY, px + 210, 574)
 
